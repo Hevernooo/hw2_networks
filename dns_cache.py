@@ -1,14 +1,9 @@
 import socket
 import struct
 import threading
-import json
-import time
-import os
 from dataclasses import dataclass
 
-
 ROOT_SERVER = '198.41.0.4'
-CACHE_FILE = 'dns_cache.json'
 LISTEN_IP = '127.0.0.1'
 LISTEN_PORT = 53
 
@@ -37,12 +32,6 @@ def parse_domain_name(data: bytes, offset: int) -> tuple[str, int]:
     return ".".join(labels), (original_offset if jumped else offset)
 
 
-def pack_domain_name(domain: str) -> bytes:
-    if domain == "." or not domain:
-        return b"\x00"
-    return b"".join(struct.pack('!B', len(p)) + p.encode('utf-8') for p in domain.split(".")) + b"\x00"
-
-
 @dataclass
 class DNSHeader:
     tx_id: int
@@ -51,6 +40,10 @@ class DNSHeader:
     ancount: int
     nscount: int
     arcount: int
+
+    @property
+    def rcode(self) -> int:
+        return self.flags & 0x000F
 
     @classmethod
     def from_bytes(cls, data: bytes) -> 'DNSHeader':
@@ -80,52 +73,35 @@ class DNSRecord:
 
     @classmethod
     def from_bytes(cls, data: bytes, offset: int) -> tuple['DNSRecord', int]:
-        _, offset = parse_domain_name(data, offset)  # Пропускаем имя
+        _, offset = parse_domain_name(data, offset)
         rtype, rclass, ttl, rdlength = struct.unpack('!HHIH', data[offset:offset + 10])
         offset += 10
         rdata = data[offset:offset + rdlength]
         return cls(rtype, rclass, ttl, rdlength, rdata), offset + rdlength
 
 
-cache: dict[tuple[str, int], tuple[float, str]] = {}
-
-
-def load_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, 'r') as f:
-                raw_cache = json.load(f)
-                for key_str, (expiry, hex_data) in raw_cache.items():
-                    if time.time() < expiry:
-                        domain, qtype = key_str.rsplit(":", 1)
-                        cache[(domain, int(qtype))] = (expiry, hex_data)
-            print(f"[CACHE] Загружено {len(cache)} актуальных записей.")
-        except Exception as e:
-            print(f"[CACHE] Ошибка загрузки: {e}")
-
-
-def save_cache():
-    current = time.time()
-    clean_cache = {f"{k[0]}:{k[1]}": v for k, v in cache.items() if v[0] > current}
-    with open(CACHE_FILE, 'w') as f:
-        json.dump(clean_cache, f)
-
-
-def build_multiply_response(tx_id: int, domain: str) -> bytes | None:
-    if ".multiply." not in domain:
+def build_multiply_response(query_data: bytes, domain: str) -> bytes | None:
+    if ".multiply" not in domain:
         return None
+
     try:
-        left_part = domain.split(".multiply.")[0]
+        header = DNSHeader.from_bytes(query_data)
+        _, offset = DNSQuestion.from_bytes(query_data, 12)
+
+        original_question = query_data[12:offset]
+
+        left_part = domain.split(".multiply")[0]
         result = 1
         for num in left_part.split("."):
             if num.isdigit():
                 result = (result * int(num)) % 256
 
-        header = struct.pack('!HHHHHH', tx_id, 0x8180, 1, 1, 0, 0)
-        question = pack_domain_name(domain) + struct.pack('!HH', 1, 1)
+        resp_header = struct.pack('!HHHHHH', header.tx_id, 0x8180, 1, 1, 0, 0)
         answer = struct.pack('!HHHIH', 0xC00C, 1, 1, 300, 4) + socket.inet_aton(f"127.0.0.{result}")
-        return header + question + answer
-    except Exception:
+
+        return resp_header + original_question + answer
+    except Exception as e:
+        print(f"[MULTIPLY ERROR] Ошибка при сборке пакета: {e}")
         return None
 
 
@@ -139,9 +115,8 @@ def extract_next_ns_ip(data: bytes, offset: int, header: DNSHeader) -> str | Non
     return None
 
 
-def resolve_iterative(query_data: bytes, domain: str, qtype: int) -> bytes:
+def resolve_iterative(query_data: bytes) -> bytes:
     target_ip = ROOT_SERVER
-
     while True:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -172,25 +147,15 @@ def process_query(data: bytes) -> bytes:
         header = DNSHeader.from_bytes(data)
         question, _ = DNSQuestion.from_bytes(data, 12)
 
-        mult_resp = build_multiply_response(header.tx_id, question.name)
+        mult_resp = build_multiply_response(data, question.name)
         if mult_resp:
             return mult_resp
 
-        cache_key = (question.name, question.qtype)
+        resolved_data = resolve_iterative(data)
+        orig_flags = struct.unpack('!H', resolved_data[2:4])[0]
+        new_flags = orig_flags | 0x0080
 
-        if cache_key in cache:
-            expiry, hex_data = cache[cache_key]
-            if time.time() < expiry:
-                cached_bytes = bytes.fromhex(hex_data)
-                return struct.pack('!H', header.tx_id) + cached_bytes[2:]
-            else:
-                del cache[cache_key]
-
-        resolved_data = resolve_iterative(data, question.name, question.qtype)
-
-        cache[cache_key] = (time.time() + 300, resolved_data.hex())
-        return struct.pack('!H', header.tx_id) + resolved_data[2:]
-
+        return struct.pack('!HH', header.tx_id, new_flags) + resolved_data[4:]
     except Exception as e:
         print(f"[ERROR] Не удалось обработать пакет: {e}")
         return data[:2] + b"\x81\x82" + data[4:]
@@ -202,41 +167,8 @@ def udp_server():
     print(f"[UDP] Сервер запущен на {LISTEN_IP}:{LISTEN_PORT}")
     while True:
         data, addr = sock.recvfrom(1024)
-        threading.Thread(target=lambda: sock.sendto(process_query(data), addr), daemon=True).start()
-
-
-def tcp_server():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind((LISTEN_IP, LISTEN_PORT))
-    sock.listen(5)
-    print(f"[TCP] Сервер запущен на {LISTEN_IP}:{LISTEN_PORT}")
-
-    def handle_client(conn):
-        with conn:
-            try:
-                length_bytes = conn.recv(2)
-                if not length_bytes: return
-                msg_len = struct.unpack('!H', length_bytes)[0]
-                data = conn.recv(msg_len)
-
-                response = process_query(data)
-                conn.sendall(struct.pack('!H', len(response)) + response)
-            except Exception as e:
-                print(f"[TCP ERROR] {e}")
-
-    while True:
-        conn, addr = sock.accept()
-        threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+        threading.Thread(target=lambda d=data, a=addr: sock.sendto(process_query(d), a), daemon=True).start()
 
 
 if __name__ == '__main__':
-    load_cache()
-
-    def cache_saver():
-        while True:
-            time.sleep(10)
-            save_cache()
-
-    threading.Thread(target=cache_saver, daemon=True).start()
-    threading.Thread(target=tcp_server, daemon=True).start()
     udp_server()
