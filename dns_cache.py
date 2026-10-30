@@ -193,7 +193,6 @@ def process_query(data: bytes) -> bytes:
 
     except Exception as e:
         print(f"[ERROR] Не удалось обработать пакет: {e}")
-        # Возвращаем SERVFAIL
         return data[:2] + b"\x81\x82" + data[4:]
 
 
